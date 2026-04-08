@@ -523,7 +523,7 @@ python main.py
 python main.py 10
 
 # All interfaces
-python main.py all
+python main.py 
 ```
 
 ### Expected Output
