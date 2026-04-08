@@ -1,15 +1,15 @@
-# Top-N Interface Traffic Visibility — SONiC Feature
+# Top-N Interface Traffic Visibility-SONiC Feature
 
 ## Table of Contents
 
 1. [Project Overview](#project-overview)
 2. [Problem Statement](#problem-statement)
 3. [Repository Structure](#repository-structure)
-4. [The Prototype — What It Is and Why It Exists](#the-prototype)
-5. [Min-Heap Algorithm — Deep Explanation](#min-heap-algorithm)
-6. [Prototype Walkthrough — File by File](#prototype-walkthrough)
+4. [The Prototype-What It Is and Why It Exists](#the-prototype)
+5. [Min-Heap Algorithm-Deep Explanation](#min-heap-algorithm)
+6. [Prototype Walkthrough-File by File](#prototype-walkthrough)
 7. [Prototype Limitations](#prototype-limitations)
-8. [The Actual Solution — Architecture](#the-actual-solution)
+8. [The Actual Solution-Architecture](#the-actual-solution)
 9. [Full Data Flow](#full-data-flow)
 10. [Key Difference: Single Snapshot vs Delta Sampling](#key-difference)
 11. [How to Run the Prototype](#how-to-run-the-prototype)
@@ -34,9 +34,9 @@ This is critical for:
 
 SONiC already collects per-interface traffic counters and exposes them via `show interfaces counters`. However, on a switch with 128+ interfaces, an operator must manually scan every row to find the busiest ones. This is:
 
-- **Slow** — reading 128 rows takes time and attention
-- **Error-prone** — humans miss rows under pressure
-- **Not automation-friendly** — no machine-readable sorted output exists
+- **Slow**-reading 128 rows takes time and attention
+- **Error-prone**-humans miss rows under pressure
+- **Not automation-friendly**-no machine-readable sorted output exists
 
 **What we need:** A single command that answers *"which interfaces are carrying the most traffic right now?"* in under 5 seconds.
 
@@ -52,14 +52,14 @@ graph TD
     CORE["core/"]
     UTILS["utils/"]
     DATA["data/"]
-    MAIN["main.py\nEntry point — wires all layers together"]
+    MAIN["main.py\nEntry point-wires all layers together"]
     README["README.md"]
 
     INIT1["__init__.py"]
     PROC["processor.py\nMin-heap logic\nReads counter DB\nReturns top-N"]
 
     INIT2["__init__.py"]
-    MATH["math_engine.py\nns_diff() — delta calculation\nformat_brate() — human readable rates"]
+    MATH["math_engine.py\nns_diff()-delta calculation\nformat_brate()-human readable rates"]
 
     DB["counter_db.json\nMock COUNTERS_DB\nMirrors real Redis structure\nNo switch needed for dev"]
 
@@ -113,10 +113,10 @@ The prototype is a **standalone Python script** that simulates the core logic of
 
 Before integrating into a complex codebase like `sonic-utilities`, a prototype lets you:
 
-1. **Validate the algorithm** — confirm the min-heap produces correct rankings
-2. **Understand the data shape** — explore what COUNTERS_DB actually contains
-3. **Test formatting** — see what output looks like before wiring up CLI
-4. **Iterate fast** — no SONiC environment needed, runs anywhere with Python
+1. **Validate the algorithm**-confirm the min-heap produces correct rankings
+2. **Understand the data shape**-explore what COUNTERS_DB actually contains
+3. **Test formatting**-see what output looks like before wiring up CLI
+4. **Iterate fast**-no SONiC environment needed, runs anywhere with Python
 
 ### Prototype Internal Architecture
 
@@ -124,12 +124,12 @@ Before integrating into a complex codebase like `sonic-utilities`, a prototype l
 graph TD
     USER(["User: python main.py 5"])
 
-    subgraph MAIN_LAYER["main.py — Display Layer"]
+    subgraph MAIN_LAYER["main.py-Display Layer"]
         ARGS["Parse CLI args\nn = 5"]
         TABULATE["tabulate()\nRender table to terminal"]
     end
 
-    subgraph CORE_LAYER["core/processor.py — Computation Layer"]
+    subgraph CORE_LAYER["core/processor.py-Computation Layer"]
         READ["Open counter_db.json\nParse all keys"]
         FILTER["Filter keys starting\nwith COUNTERS:oid"]
         EXTRACT["Extract rx_bytes\ntx_bytes per interface"]
@@ -137,11 +137,11 @@ graph TD
         SORT["Sort heap descending\nReturn ranked list"]
     end
 
-    subgraph MATH_LAYER["utils/math_engine.py — Math Layer"]
+    subgraph MATH_LAYER["utils/math_engine.py-Math Layer"]
         BRATE["format_brate()\nBytes to KB/MB/GB string"]
     end
 
-    subgraph DATA_LAYER["data/counter_db.json — Data Layer"]
+    subgraph DATA_LAYER["data/counter_db.json-Data Layer"]
         JSON["Mock COUNTERS_DB\nSAI_PORT_STAT_IF_IN_OCTETS\nSAI_PORT_STAT_IF_OUT_OCTETS"]
     end
 
@@ -176,11 +176,11 @@ top_n = all_interfaces[:n]
 
 **Why this is wrong for production:**
 
-On a 128-port switch, this sorts all 128 entries every time. SONiC runs on switches with up to **512 interfaces**. You asked for top 5 — you do not need to precisely sort the bottom 507. Time complexity: **O(k log k)** where k = total interfaces.
+On a 128-port switch, this sorts all 128 entries every time. SONiC runs on switches with up to **512 interfaces**. You asked for top 5-you do not need to precisely sort the bottom 507. Time complexity: **O(k log k)** where k = total interfaces.
 
 ### The Min-Heap Approach (What We Use)
 
-A **min-heap of size N** maintains only the N largest elements seen so far. The ROOT of the heap is always the **smallest** of the current top-N — the first one to get evicted when a better candidate arrives.
+A **min-heap of size N** maintains only the N largest elements seen so far. The ROOT of the heap is always the **smallest** of the current top-N-the first one to get evicted when a better candidate arrives.
 
 ### Step-by-Step Heap Walkthrough (top 3 from 6 interfaces)
 
@@ -218,7 +218,7 @@ flowchart TD
 
 ```mermaid
 graph TD
-    subgraph STEP3["After Step 3 — Heap Full at N=3"]
+    subgraph STEP3["After Step 3-Heap Full at N=3"]
         R3["300 ROOT\nEthernet8\nSmallest, evicted next"]
         C3A["1200\nEthernet4"]
         C3B["500\nEthernet0"]
@@ -226,7 +226,7 @@ graph TD
         R3 --> C3B
     end
 
-    subgraph STEP4["After Step 4 — Ethernet8 evicted"]
+    subgraph STEP4["After Step 4-Ethernet8 evicted"]
         R4["500 ROOT\nEthernet0\nNow weakest member"]
         C4A["1200\nEthernet4"]
         C4B["800\nEthernet12"]
@@ -234,7 +234,7 @@ graph TD
         R4 --> C4B
     end
 
-    subgraph FINAL2["Final — After Step 6"]
+    subgraph FINAL2["Final-After Step 6"]
         R5["800 ROOT\nEthernet12"]
         C5A["1200\nEthernet4"]
         C5B["950\nEthernet20"]
@@ -287,9 +287,9 @@ return sorted(min_heap, key=lambda x: x[0], reverse=True)
 
 ---
 
-## Prototype Walkthrough — File by File
+## Prototype Walkthrough-File by File
 
-### `data/counter_db.json` — The Mock Database
+### `data/counter_db.json`-The Mock Database
 
 This file mirrors the exact structure of SONiC's Redis `COUNTERS_DB`. In production, data lives in Redis. In the prototype, it lives in this JSON file.
 
@@ -330,7 +330,7 @@ erDiagram
     COUNTERS_PORT_NAME_MAP ||--o{ COUNTERS_OID : "OID links to counter entry"
 ```
 
-### `utils/math_engine.py` — Pure Math Layer
+### `utils/math_engine.py`-Pure Math Layer
 
 ```python
 def ns_diff(new_val, old_val):
@@ -338,7 +338,7 @@ def ns_diff(new_val, old_val):
     return max(0, diff)   # guard against counter resets
 ```
 
-The `max(0, diff)` guard handles counter resets — if a counter rolls back to zero after a reboot or clear, we return 0 instead of a massive negative number.
+The `max(0, diff)` guard handles counter resets-if a counter rolls back to zero after a reboot or clear, we return 0 instead of a massive negative number.
 
 ### Counter Reset Guard Logic
 
@@ -380,28 +380,28 @@ flowchart TD
 graph TB
     USER(["Operator\nshow interfaces counters top-n\n--count 5 --interval 3 --json"])
 
-    subgraph CLI["CLI Layer — show/interfaces.py"]
+    subgraph CLI["CLI Layer-show/interfaces.py"]
         CMD["@interfaces.command top-n\n--count  --interval  --json"]
         DISP_TABLE["tabulate() table display"]
         DISP_JSON["json.dumps() output"]
     end
 
-    subgraph COMPUTE["Computation Layer — utilities_common/portstat.py"]
+    subgraph COMPUTE["Computation Layer-utilities_common/portstat.py"]
         PORTSTAT["class Portstat"]
         GET_TOP["get_top_n_interfaces(n, interval)"]
-        GET_CNSTAT["get_cnstat() — existing method, reused"]
+        GET_CNSTAT["get_cnstat()-existing method, reused"]
         SLEEP["time.sleep(interval)"]
         DELTA["Delta per interface\nrx_delta + tx_delta = total"]
         HEAP2["Min-heap → top N"]
         STATE["get_port_state()\nget_port_speed()"]
     end
 
-    subgraph MATH["Math Layer — utilities_common/netstat.py"]
-        NSDIFF["ns_diff() — safe delta"]
-        FMTBRATE["format_brate() — human readable"]
+    subgraph MATH["Math Layer-utilities_common/netstat.py"]
+        NSDIFF["ns_diff()-safe delta"]
+        FMTBRATE["format_brate()-human readable"]
     end
 
-    subgraph DB["Database Layer — Redis"]
+    subgraph DB["Database Layer-Redis"]
         MAP["COUNTERS_PORT_NAME_MAP\nEthernet0 → oid:0x1"]
         CTRS["COUNTERS:oid:0x1\nSAI_PORT_STAT_IF_IN_OCTETS\nSAI_PORT_STAT_IF_OUT_OCTETS"]
         APPL["APPL_DB PORT_TABLE\noper_status, admin_status, speed"]
@@ -482,7 +482,7 @@ sequenceDiagram
 
 ```mermaid
 flowchart LR
-    subgraph PROTOTYPE["Prototype — Single Snapshot"]
+    subgraph PROTOTYPE["Prototype-Single Snapshot"]
         direction TB
         T_NOW["T = now\nRead counters once"]
         SORT_ABS["Sort by absolute bytes\nsince switch booted"]
@@ -490,7 +490,7 @@ flowchart LR
         T_NOW --> SORT_ABS --> PROBLEM
     end
 
-    subgraph PRODUCTION["Production — Delta Sampling"]
+    subgraph PRODUCTION["Production-Delta Sampling"]
         direction TB
         T0["T = 0\nRead counters, store as sample_1"]
         SLEEP2["sleep interval seconds"]
@@ -560,7 +560,7 @@ flowchart LR
 
 | Step | Task | Files Changed |
 |---|---|---|
-| 1 | Delta sampling — two `get_cnstat()` calls with `time.sleep()` | `utilities_common/portstat.py` |
+| 1 | Delta sampling-two `get_cnstat()` calls with `time.sleep()` | `utilities_common/portstat.py` |
 | 2 | OID → interface name via `COUNTERS_PORT_NAME_MAP` | `utilities_common/portstat.py` |
 | 3 | Click command `show interfaces counters top-n` | `show/interfaces.py` |
 | 4 | `--count`, `--interval`, `--json` flags | `show/interfaces.py` |
