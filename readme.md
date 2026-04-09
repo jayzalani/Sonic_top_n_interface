@@ -1,21 +1,5 @@
 # Top-N Interface Traffic Visibility-SONiC Feature
 
-## Table of Contents
-
-1. [Project Overview](#project-overview)
-2. [Problem Statement](#problem-statement)
-3. [Repository Structure](#repository-structure)
-4. [The Prototype-What It Is and Why It Exists](#the-prototype)
-5. [Min-Heap Algorithm-Deep Explanation](#min-heap-algorithm)
-6. [Prototype Walkthrough-File by File](#prototype-walkthrough)
-7. [Prototype Limitations](#prototype-limitations)
-8. [The Actual Solution-Architecture](#the-actual-solution)
-9. [Full Data Flow](#full-data-flow)
-10. [Key Difference: Single Snapshot vs Delta Sampling](#key-difference)
-11. [How to Run the Prototype](#how-to-run-the-prototype)
-12. [What Comes Next](#what-comes-next)
-
----
 
 ## Project Overview
 
@@ -29,545 +13,177 @@ This is critical for:
 - **Automation pipelines** that need programmatic access to traffic rankings
 
 ---
+## CounterDB Overview
 
-## Problem Statement
+The data source for this project is COUNTERS_DB, a Redis database embedded in SONiC that stores real-time telemetry for every hardware object on the switch. It is exported as a flat JSON file for use in this prototype. It is a Mock Database that is present in Sonic Utilities for testing.
 
-SONiC already collects per-interface traffic counters and exposes them via `show interfaces counters`. However, on a switch with 128+ interfaces, an operator must manually scan every row to find the busiest ones. This is:
+### Top-Level JSON Structure
 
-- **Slow**-reading 128 rows takes time and attention
-- **Error-prone**-humans miss rows under pressure
-- **Not automation-friendly**-no machine-readable sorted output exists
+Every entry in the exported JSON follows this exact pattern:
 
-**What we need:** A single command that answers *"which interfaces are carrying the most traffic right now?"* in under 5 seconds.
-
----
-
-## Repository Structure
-
-### Prototype Layout
-
-```mermaid
-graph TD
-    ROOT["project-root/"]
-    CORE["core/"]
-    UTILS["utils/"]
-    DATA["data/"]
-    MAIN["main.py\nEntry point-wires all layers together"]
-    README["README.md"]
-
-    INIT1["__init__.py"]
-    PROC["processor.py\nMin-heap logic\nReads counter DB\nReturns top-N"]
-
-    INIT2["__init__.py"]
-    MATH["math_engine.py\nns_diff()-delta calculation\nformat_brate()-human readable rates"]
-
-    DB["counter_db.json\nMock COUNTERS_DB\nMirrors real Redis structure\nNo switch needed for dev"]
-
-    ROOT --> CORE
-    ROOT --> UTILS
-    ROOT --> DATA
-    ROOT --> MAIN
-    ROOT --> README
-
-    CORE --> INIT1
-    CORE --> PROC
-
-    UTILS --> INIT2
-    UTILS --> MATH
-
-    DATA --> DB
 ```
-
-### How Prototype Maps to Real SONiC Repository
-
-```mermaid
-graph LR
-    subgraph PROTOTYPE["Prototype"]
-        MP["main.py"]
-        PP["core/processor.py"]
-        ME["utils/math_engine.py"]
-    end
-
-    subgraph SONIC["sonic-utilities (Production)"]
-        SI["show/interfaces.py\nClick CLI command"]
-        PS["utilities_common/portstat.py\nPortstat class"]
-        NS["utilities_common/netstat.py\nns_diff, format_brate"]
-        TS["tests/top_n_interface_test.py"]
-    end
-
-    MP -->|"moves to"| SI
-    PP -->|"moves to"| PS
-    ME -->|"already exists as"| NS
-    MP -->|"tests move to"| TS
-```
-
----
-
-## The Prototype
-
-### What It Is
-
-The prototype is a **standalone Python script** that simulates the core logic of the final feature **without requiring a real SONiC switch or Redis database**. It reads from a local JSON file that mirrors the exact structure of SONiC's `COUNTERS_DB`.
-
-### Why Build a Prototype First
-
-Before integrating into a complex codebase like `sonic-utilities`, a prototype lets you:
-
-1. **Validate the algorithm**-confirm the min-heap produces correct rankings
-2. **Understand the data shape**-explore what COUNTERS_DB actually contains
-3. **Test formatting**-see what output looks like before wiring up CLI
-4. **Iterate fast**-no SONiC environment needed, runs anywhere with Python
-
-### Prototype Internal Architecture
-
-```mermaid
-graph TD
-    USER(["User: python main.py 5"])
-
-    subgraph MAIN_LAYER["main.py-Display Layer"]
-        ARGS["Parse CLI args\nn = 5"]
-        TABULATE["tabulate()\nRender table to terminal"]
-    end
-
-    subgraph CORE_LAYER["core/processor.py-Computation Layer"]
-        READ["Open counter_db.json\nParse all keys"]
-        FILTER["Filter keys starting\nwith COUNTERS:oid"]
-        EXTRACT["Extract rx_bytes\ntx_bytes per interface"]
-        HEAP["Min-Heap of size N\nMaintain top-N by total bytes"]
-        SORT["Sort heap descending\nReturn ranked list"]
-    end
-
-    subgraph MATH_LAYER["utils/math_engine.py-Math Layer"]
-        BRATE["format_brate()\nBytes to KB/MB/GB string"]
-    end
-
-    subgraph DATA_LAYER["data/counter_db.json-Data Layer"]
-        JSON["Mock COUNTERS_DB\nSAI_PORT_STAT_IF_IN_OCTETS\nSAI_PORT_STAT_IF_OUT_OCTETS"]
-    end
-
-    USER --> ARGS
-    ARGS --> READ
-    READ --> JSON
-    JSON --> FILTER
-    FILTER --> EXTRACT
-    EXTRACT --> HEAP
-    HEAP --> SORT
-    SORT --> TABULATE
-    TABULATE --> BRATE
-    BRATE --> TABULATE
-```
-
----
-
-## Min-Heap Algorithm
-
-This is the most important algorithmic decision in the entire project. Understanding it deeply will matter when you present or defend the implementation.
-
-### The Naive Approach (Do Not Use)
-
-The obvious solution to "find top N from a list" is:
-
-```python
-# Sort all interfaces by traffic
-all_interfaces = sorted(all_data, key=lambda x: x['total'], reverse=True)
-# Take first N
-top_n = all_interfaces[:n]
-```
-
-**Why this is wrong for production:**
-
-On a 128-port switch, this sorts all 128 entries every time. SONiC runs on switches with up to **512 interfaces**. You asked for top 5-you do not need to precisely sort the bottom 507. Time complexity: **O(k log k)** where k = total interfaces.
-
-### The Min-Heap Approach (What We Use)
-
-A **min-heap of size N** maintains only the N largest elements seen so far. The ROOT of the heap is always the **smallest** of the current top-N-the first one to get evicted when a better candidate arrives.
-
-### Step-by-Step Heap Walkthrough (top 3 from 6 interfaces)
-
-```mermaid
-flowchart TD
-    START(["Start: want top 3, heap is empty"])
-
-    S1["Push Ethernet0 total=500\nHeap: [500]"]
-    S2["Push Ethernet4 total=1200\nHeap: [500, 1200]"]
-    S3["Push Ethernet8 total=300\nHeap: [300, 1200, 500]\nSize = N = 3, Root = 300 smallest"]
-
-    S4_CHECK{"Push Ethernet12 total=800\n800 > root 300?"}
-    S4_YES["POP 300, Ethernet8 eliminated\nPUSH 800\nHeap: [500, 1200, 800]"]
-
-    S5_CHECK{"Push Ethernet16 total=100\n100 > root 500?"}
-    S5_NO["DO NOTHING\nEthernet16 eliminated immediately\nHeap unchanged: [500, 1200, 800]"]
-
-    S6_CHECK{"Push Ethernet20 total=950\n950 > root 500?"}
-    S6_YES["POP 500, Ethernet0 eliminated\nPUSH 950\nHeap: [800, 1200, 950]"]
-
-    FINAL["Final Heap: [800, 1200, 950]\nSort descending: [1200, 950, 800]"]
-    RESULT(["Result: Ethernet4, Ethernet20, Ethernet12"])
-
-    START --> S1 --> S2 --> S3
-    S3 --> S4_CHECK
-    S4_CHECK -->|Yes| S4_YES
-    S4_YES --> S5_CHECK
-    S5_CHECK -->|No| S5_NO
-    S5_NO --> S6_CHECK
-    S6_CHECK -->|Yes| S6_YES
-    S6_YES --> FINAL --> RESULT
-```
-
-### Heap State at Key Steps
-
-```mermaid
-graph TD
-    subgraph STEP3["After Step 3-Heap Full at N=3"]
-        R3["300 ROOT\nEthernet8\nSmallest, evicted next"]
-        C3A["1200\nEthernet4"]
-        C3B["500\nEthernet0"]
-        R3 --> C3A
-        R3 --> C3B
-    end
-
-    subgraph STEP4["After Step 4-Ethernet8 evicted"]
-        R4["500 ROOT\nEthernet0\nNow weakest member"]
-        C4A["1200\nEthernet4"]
-        C4B["800\nEthernet12"]
-        R4 --> C4A
-        R4 --> C4B
-    end
-
-    subgraph FINAL2["Final-After Step 6"]
-        R5["800 ROOT\nEthernet12"]
-        C5A["1200\nEthernet4"]
-        C5B["950\nEthernet20"]
-        R5 --> C5A
-        R5 --> C5B
-    end
-
-    STEP3 -->|"Ethernet12=800 arrives\n800 > 300, evict 300"| STEP4
-    STEP4 -->|"Ethernet20=950 arrives\n950 > 500, evict 500"| FINAL2
-```
-
-### Complexity Comparison
-
-| Approach | Time Complexity | Space Complexity | k=512, n=5 |
-|---|---|---|---|
-| Sort all | O(k log k) | O(k) | 4,608 operations |
-| Min-heap | O(k log n) | O(n) | 1,177 operations |
-
-The heap does **75% less work** and holds only N items in memory regardless of total interface count.
-
-### The Code
-
-```python
-# core/processor.py
-
-import heapq
-
-min_heap = []
-
-for key, content in data.items():
-    if key.startswith("COUNTERS:oid"):
-
-        rx_bytes = int(vals.get('SAI_PORT_STAT_IF_IN_OCTETS', 0))
-        tx_bytes = int(vals.get('SAI_PORT_STAT_IF_OUT_OCTETS', 0))
-        total_bytes = rx_bytes + tx_bytes
-
-        # Python's heapq is a MIN-heap
-        # heapq compares on the first element of the tuple
-        entry = (total_bytes, info_dict)
-        heapq.heappush(min_heap, entry)
-
-        # If heap exceeds N, pop the SMALLEST (the root)
-        # This keeps only the N largest seen so far
-        if len(min_heap) > n:
-            heapq.heappop(min_heap)
-
-# Sort the remaining N items descending for display
-return sorted(min_heap, key=lambda x: x[0], reverse=True)
-```
-
----
-
-## Prototype Walkthrough-File by File
-
-### `data/counter_db.json`-The Mock Database
-
-This file mirrors the exact structure of SONiC's Redis `COUNTERS_DB`. In production, data lives in Redis. In the prototype, it lives in this JSON file.
-
-```json
-{
-  "COUNTERS_PORT_NAME_MAP": {
-    "value": {
-      "Ethernet0": "oid:0x1000000000001",
-      "Ethernet4": "oid:0x1000000000002"
-    }
-  },
-  "COUNTERS:oid:0x1000000000001": {
-    "value": {
-      "SAI_PORT_STAT_IF_IN_OCTETS":  "1048576000",
-      "SAI_PORT_STAT_IF_OUT_OCTETS": "524288000"
-    }
-  }
+"<TABLE_NAME>:oid:<hex_object_id>": {
+  "expireat": <unix_timestamp>,
+  "ttl": -0.001,
+  "type": "hash",
+  "value": { ... stat key-value pairs ... }
 }
 ```
 
-### Database Key Structure
 
-```mermaid
-erDiagram
-    COUNTERS_PORT_NAME_MAP {
-        string Ethernet0 "oid:0x1000000000001"
-        string Ethernet4 "oid:0x1000000000002"
-        string Ethernet8 "oid:0x1000000000003"
-    }
+| Field      | What It Means                                                                |
+| ---------- | ---------------------------------------------------------------------------- |
+| TABLE_NAME | Category of the stat: COUNTERS, QUEUE_STAT_WATERMARKS, USER_WATERMARKS       |
+| oid:0x...  | Object ID, a hex identifier for a specific hardware object (port, queue, PG) |
+| expireat   | Unix timestamp of when this snapshot was captured                            |
+| ttl        | `-0.001` → Entry never expires (persisted in Redis)                          |
+| type       | Redis data type → `hash`                                                     |
+| value      | Key-value pairs of SAI stat names to raw integer values                      |
 
-    COUNTERS_OID {
-        string SAI_PORT_STAT_IF_IN_OCTETS "RX bytes since boot"
-        string SAI_PORT_STAT_IF_OUT_OCTETS "TX bytes since boot"
-        string SAI_PORT_STAT_IF_IN_UCAST_PKTS "RX packets"
-        string SAI_PORT_STAT_IF_OUT_UCAST_PKTS "TX packets"
-    }
+### Table Namespaces
 
-    COUNTERS_PORT_NAME_MAP ||--o{ COUNTERS_OID : "OID links to counter entry"
+The JSON file contains three distinct table prefixes, each tracking a different hardware layer:
+
+| Table Prefix          | Hardware Layer       | What It Tracks                                   |
+| --------------------- | -------------------- | ------------------------------------------------ |
+| COUNTERS              | Port level           | Per-interface packet and byte stats (RX/TX)      |
+| QUEUE_STAT_WATERMARKS | Queue level          | Peak memory usage per egress queue               |
+| USER_WATERMARKS       | Priority Group level | Buffer headroom usage for PFC per priority class |
+
+### Counter Fields Inside value
+
+For COUNTERS (port-level stats), the value object holds SAI standard counter names:
+
+| SAI Counter Name                    | Meaning                              |
+| ----------------------------------- | ------------------------------------ |
+| SAI_PORT_STAT_IF_IN_OCTETS          | Total bytes received                 |
+| SAI_PORT_STAT_IF_OUT_OCTETS         | Total bytes sent                     |
+| SAI_PORT_STAT_IF_IN_UCAST_PKTS      | Unicast packets received             |
+| SAI_PORT_STAT_IF_OUT_UCAST_PKTS     | Unicast packets sent                 |
+| SAI_PORT_STAT_IF_IN_DISCARDS        | Incoming packets dropped             |
+| SAI_PORT_STAT_PFC_0_RX_PKTS → PFC_7 | PFC packets per priority class (0–7) |
+
+For USER_WATERMARKS, the value object holds priority group buffer stats:
+
+| SAI Counter Name                                          | Meaning                    |
+| --------------------------------------------------------- | -------------------------- |
+| SAI_INGRESS_PRIORITY_GROUP_STAT_SHARED_WATERMARK_BYTES    | Peak shared buffer usage   |
+| SAI_INGRESS_PRIORITY_GROUP_STAT_XOFF_ROOM_WATERMARK_BYTES | Peak headroom buffer usage |
+
+Important note: all counter values in COUNTERS_DB are monotonically increasing cumulative totals, not rates. Computing actual traffic rates requires taking two snapshots separated by a time interval and computing the delta between them.
+
+## The Prototype
+The prototype is a standalone Python CLI tool that reads a single static JSON snapshot of COUNTERS_DB and prints the top N interfaces by total bytes (RX plus TX). It is intentionally minimal, focused entirely on proving out the core data parsing and ranking logic before integrating into SONiC CLI.
+### Project Structure
+```
+project/
+  main.py              Entry point, argument parsing, table rendering
+  core/
+    processor.py       JSON parsing, counter extraction, heap-based ranking
+  utils/
+    math_engine.py     Counter delta helper and byte formatter
+  data/
+    counter_db.json    Static JSON snapshot of COUNTERS_DB
+```
+###  Usage
+```
+# Show top 5 interfaces
+python main.py 5
+
+# Show top 10 interfaces
+python main.py 10
+```
+The Output I get from Usage of Mock CounterDB: 
+
+<img width="785" height="262" alt="Screenshot 2026-04-08 231240" src="https://github.com/user-attachments/assets/82b80b66-a995-4a66-b552-756442559a6c" />
+
+## Core Logic
+This is the most important section. The two key algorithmic decisions in the prototype are the heap-based top-N selection and the counter extraction strategy. Everything else is plumbing.
+### Why a Min-Heap
+The naive approach to finding the top N items from a list of k items is to sort everything and take the first N. That costs O(k log k) time and O(k) space, where k is the total number of interfaces on the switch. In large deployments k can be in the hundreds.
+
+The prototype instead uses a min-heap of fixed size N. The algorithm works as follows:
+
+1. Push every interface into the heap as a tuple of (total_bytes, interface_info)
+2. After each push, if the heap size exceeds N, pop the smallest element
+3. At the end of the loop, the heap contains exactly the top N interfaces
+4. Sort the heap in descending order for display
+
+This reduces time complexity to O(k log N) and space complexity to O(N). When N is 5 and k is 500, that is a significant difference. Python's heapq module implements a min-heap natively, so the smallest total_bytes value is always at the root and gets evicted first whenever the heap overflows N.
+
+### Counter Key Filtering
+
+The JSON snapshot contains entries from all three table namespaces (COUNTERS, QUEUE_STAT_WATERMARKS, USER_WATERMARKS). The processor filters to only port-level entries by checking the key prefix:
+```if key.startswith("COUNTERS:oid"):```
+This is the correct filter. Only COUNTERS prefix entries contain SAI_PORT_STAT_IF_IN_OCTETS and SAI_PORT_STAT_IF_OUT_OCTETS. Watermark entries use entirely different stat names and would cause KeyError or silently return zero if not filtered.
+
+### RX and TX Extraction
+Inside each matching entry, the processor pulls two specific fields from the value hash:
+```
+rx_bytes = int(vals.get('SAI_PORT_STAT_IF_IN_OCTETS', 0))
+tx_bytes = int(vals.get('SAI_PORT_STAT_IF_OUT_OCTETS', 0))
+total_bytes = rx_bytes + tx_bytes
+
+```
+Using .get() with a default of 0 is important because some interfaces (especially admin-down ones) may be missing certain counter fields entirely. Casting to int is required because Redis stores all values as strings, and that carries through to the JSON export.
+### The ns_diff Function
+math_engine.py contains a function called ns_diff that computes the delta between two counter snapshots:
 ```
 
-### `utils/math_engine.py`-Pure Math Layer
-
-```python
 def ns_diff(new_val, old_val):
     diff = int(new_val) - int(old_val)
-    return max(0, diff)   # guard against counter resets
-```
-
-The `max(0, diff)` guard handles counter resets-if a counter rolls back to zero after a reboot or clear, we return 0 instead of a massive negative number.
-
-### Counter Reset Guard Logic
-
-```mermaid
-flowchart TD
-    INPUT(["ns_diff(new_val, old_val)"])
-    CALC["diff = int(new_val) - int(old_val)"]
-    CHECK{"diff < 0 ?"}
-    NORMAL["return diff\nNormal counter increment"]
-    RESET["return 0\nCounter was reset\nreboot or show counters -c\nProtects against negative spike"]
-
-    INPUT --> CALC --> CHECK
-    CHECK -->|No| NORMAL
-    CHECK -->|Yes| RESET
-```
-
----
-
-## Prototype Limitations
-
-| Gap | Prototype | Production Solution |
-|---|---|---|
-| **Sampling** | Single snapshot, absolute bytes | Two snapshots, delta = actual rate |
-| **Interface names** | Shows raw OIDs | Maps OIDs to Ethernet names |
-| **Port state** | Not shown | U / D / X column |
-| **Database** | JSON file | Live Redis via `swsscommon` |
-| **CLI** | `python main.py` | `show interfaces counters top-n` |
-| **JSON flag** | Not supported | `--json` flag |
-| **Interval config** | Not supported | `--interval` flag |
-| **Utilization %** | Not shown | RX_UTIL and TX_UTIL columns |
-
----
-
-## The Actual Solution
-
-### Full System Architecture
-
-```mermaid
-graph TB
-    USER(["Operator\nshow interfaces counters top-n\n--count 5 --interval 3 --json"])
-
-    subgraph CLI["CLI Layer-show/interfaces.py"]
-        CMD["@interfaces.command top-n\n--count  --interval  --json"]
-        DISP_TABLE["tabulate() table display"]
-        DISP_JSON["json.dumps() output"]
-    end
-
-    subgraph COMPUTE["Computation Layer-utilities_common/portstat.py"]
-        PORTSTAT["class Portstat"]
-        GET_TOP["get_top_n_interfaces(n, interval)"]
-        GET_CNSTAT["get_cnstat()-existing method, reused"]
-        SLEEP["time.sleep(interval)"]
-        DELTA["Delta per interface\nrx_delta + tx_delta = total"]
-        HEAP2["Min-heap → top N"]
-        STATE["get_port_state()\nget_port_speed()"]
-    end
-
-    subgraph MATH["Math Layer-utilities_common/netstat.py"]
-        NSDIFF["ns_diff()-safe delta"]
-        FMTBRATE["format_brate()-human readable"]
-    end
-
-    subgraph DB["Database Layer-Redis"]
-        MAP["COUNTERS_PORT_NAME_MAP\nEthernet0 → oid:0x1"]
-        CTRS["COUNTERS:oid:0x1\nSAI_PORT_STAT_IF_IN_OCTETS\nSAI_PORT_STAT_IF_OUT_OCTETS"]
-        APPL["APPL_DB PORT_TABLE\noper_status, admin_status, speed"]
-    end
-
-    USER --> CMD
-    CMD --> GET_TOP
-    GET_TOP --> GET_CNSTAT
-    GET_CNSTAT --> MAP
-    GET_CNSTAT --> CTRS
-    GET_TOP --> SLEEP
-    SLEEP --> GET_CNSTAT
-    GET_TOP --> DELTA
-    DELTA --> NSDIFF
-    DELTA --> HEAP2
-    HEAP2 --> STATE
-    STATE --> APPL
-    HEAP2 --> CMD
-    CMD -->|"--json flag set"| DISP_JSON
-    CMD -->|"default table"| DISP_TABLE
-    DISP_TABLE --> FMTBRATE
-```
-
----
-
-## Full Data Flow
-
-```mermaid
-sequenceDiagram
-    actor User
-    participant CLI as show/interfaces.py
-    participant Portstat as portstat.py
-    participant NetStat as netstat.py
-    participant Redis as COUNTERS_DB Redis
-
-    User->>CLI: show interfaces counters top-n --count 5 --interval 3
-
-    CLI->>Portstat: get_top_n_interfaces(n=5, interval=3)
-
-    Note over Portstat: Sample 1 at T=0
-    Portstat->>Redis: GET COUNTERS_PORT_NAME_MAP
-    Redis-->>Portstat: Ethernet0 oid:0x1, Ethernet4 oid:0x2 ...
-    Portstat->>Redis: GET COUNTERS:oid for all ports
-    Redis-->>Portstat: rx_bytes, tx_bytes per port
-    Note over Portstat: Stored as sample_1
-
-    Note over Portstat: time.sleep(3 seconds)
-
-    Note over Portstat: Sample 2 at T=3
-    Portstat->>Redis: GET COUNTERS:oid for all ports
-    Redis-->>Portstat: rx_bytes, tx_bytes per port now higher
-    Note over Portstat: Stored as sample_2
-
-    loop For each interface
-        Portstat->>NetStat: ns_diff(sample2.rx_byt, sample1.rx_byt)
-        NetStat-->>Portstat: rx_delta
-        Portstat->>NetStat: ns_diff(sample2.tx_byt, sample1.tx_byt)
-        NetStat-->>Portstat: tx_delta
-        Note over Portstat: total = rx_delta + tx_delta, apply min-heap
-    end
-
-    Portstat->>Redis: GET PORT_TABLE oper_status per port
-    Redis-->>Portstat: Ethernet0 up, Ethernet4 up ...
-
-    Portstat-->>CLI: sorted top-5 list with deltas and state
-
-    loop For each result row
-        CLI->>NetStat: format_brate(rx_delta / interval)
-        NetStat-->>CLI: 125.40 MB/s
-    end
-
-    CLI-->>User: Rendered table or JSON
-```
-
----
-
-## Key Difference: Single Snapshot vs Delta Sampling
-
-```mermaid
-flowchart LR
-    subgraph PROTOTYPE["Prototype-Single Snapshot"]
-        direction TB
-        T_NOW["T = now\nRead counters once"]
-        SORT_ABS["Sort by absolute bytes\nsince switch booted"]
-        PROBLEM["Problem:\nEthernet0 up 30 days = huge cumulative bytes\nEthernet4 up 1 hour running at 10 GB/s\nEthernet0 ranks higher despite being idle now\nAbsolute bytes is NOT current traffic rate"]
-        T_NOW --> SORT_ABS --> PROBLEM
-    end
-
-    subgraph PRODUCTION["Production-Delta Sampling"]
-        direction TB
-        T0["T = 0\nRead counters, store as sample_1"]
-        SLEEP2["sleep interval seconds"]
-        T3["T = interval\nRead counters, store as sample_2"]
-        DELTA2["delta = sample_2 minus sample_1\nbytes moved in exactly N seconds"]
-        RATE["rate = delta divided by interval\nbytes per second RIGHT NOW\nTrue current throughput"]
-        T0 --> SLEEP2 --> T3 --> DELTA2 --> RATE
-    end
-
-    PROTOTYPE -->|"upgrade to"| PRODUCTION
-```
-
----
-
-## How to Run the Prototype
-
-### Prerequisites
-
-```bash
-pip install tabulate
-```
-
-### Running
-
-```bash
-# Default: top 5
-python main.py
-
-# Top 10
-python main.py 10
-
-# All interfaces
-python main.py 
-```
-
-### Expected Output
+    return max(0, diff)
 
 ```
---- Top 5 Interfaces ---
-Rank  Interface               RX_Total     TX_Total     Total_Bytes
-----  ----------------------  -----------  -----------  -----------
-1     oid:0x1000000000005     125.40 MB/s  80.20 MB/s   205.60 MB/s
-2     oid:0x1000000000002     90.10 MB/s   60.50 MB/s   150.60 MB/s
-3     oid:0x1000000000008     40.00 MB/s   20.00 MB/s   60.00 MB/s
-4     oid:0x1000000000001     1.20 KB/s    500.00 B/s   1.70 KB/s
-5     oid:0x1000000000003     100.00 B/s   50.00 B/s    150.00 B/s
+This function exists in the codebase but is not yet wired into the prototype. It clamps negative values to zero to handle counter resets, which can happen when a line card reboots or when the counter overflows its 64-bit register. This function is the bridge between a static snapshot reader and a live rate calculator, and it is exactly what needs to be wired in for the actual solution.
+## Byte Formatting
+format_brate() in math_engine.py converts raw byte counts into human-readable strings using simple threshold checks:
 ```
+if rate > 10**9:  return GB/s
+elif rate > 10**6:  return MB/s
+elif rate > 10**3:  return KB/s
+else:  return B/s
 
-> **Note:** Interface names show OIDs in the prototype. The production solution resolves these to `Ethernet0`, `Ethernet4` etc. via `COUNTERS_PORT_NAME_MAP`.
-
----
-
-## What Comes Next
-
-```mermaid
-flowchart LR
-    S1["Step 1\nDelta Sampling\nportstat.py"]
-    S2["Step 2\nOID to Name\nResolution\nportstat.py"]
-    S3["Step 3\nClick Command\nshow/interfaces.py"]
-    S4["Step 4\nFlags: count\ninterval, json\nshow/interfaces.py"]
-    S5["Step 5\nPort State and\nUtilization columns\nportstat.py"]
-    S6["Step 6\nUnit Tests\ntop_n_interface_test.py"]
-    S7["Step 7\nPR to\nsonic-utilities"]
-
-    S1 --> S2 --> S3 --> S4 --> S5 --> S6 --> S7
 ```
+The function is named format_brate (byte rate) but currently receives cumulative byte totals from the snapshot, not per-second rates. In the final solution, after delta calculations are wired in, this function will be receiving genuine per-second values and the output labels will be accurate.
+## What the Actual Solution Will Look Like
+The prototype validates the parsing and ranking logic. The actual solution integrates into SONiC CLI, adds delta-based rate computation, and exposes additional output options. Here is how it differs from the prototype and what needs to be built.
+### Delta-Based Rate Calculation
+The most critical gap in the prototype is that it reads cumulative byte totals from a single snapshot. Real traffic rates require two snapshots separated by a known time interval. The actual solution will:
 
-| Step | Task | Files Changed |
-|---|---|---|
-| 1 | Delta sampling-two `get_cnstat()` calls with `time.sleep()` | `utilities_common/portstat.py` |
-| 2 | OID → interface name via `COUNTERS_PORT_NAME_MAP` | `utilities_common/portstat.py` |
-| 3 | Click command `show interfaces counters top-n` | `show/interfaces.py` |
-| 4 | `--count`, `--interval`, `--json` flags | `show/interfaces.py` |
-| 5 | Port state and utilization columns | `utilities_common/portstat.py` |
-| 6 | Unit tests using existing mock DB JSON | `tests/top_n_interface_test.py` |
-| 7 | PR to sonic-utilities following contribution guidelines | All above files |
+1. Take snapshot 1 of COUNTERS_DB, record timestamp t1
+2. Sleep for a configurable interval (default 1 second)
+3. Take snapshot 2 of COUNTERS_DB, record timestamp t2
+4. For each interface, compute delta_rx = ns_diff(snap2_rx, snap1_rx) and delta_tx = ns_diff(snap2_tx, snap1_tx)
+5. Divide by (t2 - t1) to get bytes per second
+6. Run the heap ranking on per-second values instead of cumulative totals
 
----
+ns_diff() already handles counter resets and edge cases. The interval between snapshots becomes a CLI parameter.
 
-*This document covers both the prototype (proof of concept) and the full production design. The prototype validates the core algorithm. The production implementation integrates it into SONiC's CLI with real database access, delta sampling, and complete output formatting.*
+### SONiC CLI Integration
+The actual solution will be integrated into sonic-utilities as a new CLI command. The target interface will look like:
+```
+$ show interfaces top-traffic
+$ show interfaces top-traffic --count 10
+$ show interfaces top-traffic --interval 5
+$ show interfaces top-traffic --json
+```
+This means replacing the main.py standalone script with a Click command group entry that follows the sonic-utilities conventions for argument parsing and output formatting.
+
+### Live COUNTERS_DB Access
+The prototype reads from a static JSON file. The actual solution will read directly from the Redis instance running inside the SONiC container using the sonic-py-swsssdk or the newer sonic-db-cli interface. The read logic in processor.py stays almost identical, but instead of opening a file it will query Redis hash fields directly using HGETALL on each COUNTERS:oid key.
+### JSON Output Mode
+For automation and integration with external monitoring systems like Grafana, the solution will support a --json flag that outputs results as structured JSON instead of the tabulate table. The heap result is already a Python data structure, so this is a straightforward serialization step.
+### Feature Summary
+| Feature                   | Prototype                              | Actual Solution                                      |
+|---------------------------|----------------------------------------|------------------------------------------------------|
+| Data source               | Static JSON file                       | Live Redis query via swsssdk                         |
+| Rate calculation          | Cumulative totals (incorrect)          | Delta between two timed snapshots                    |
+| CLI                       | `python main.py <N>`                   | `show interfaces top-traffic` with Click             |
+| Configurable interval     | Not supported                          | CLI flag (default: 1 second)                         |
+| JSON output               | Not supported                          | CLI flag `--json`                                    |
+| Counter reset handling    | `ns_diff` exists but unused            | Fully integrated into delta calculation              |
+| SONiC integration         | Standalone script                      | Merged into `sonic-utilities` package                |
+
+
+The prototype is a correct and clean proof of concept. All the core algorithmic work (heap ranking, SAI key filtering, byte formatting, counter diff safety) is already done. The actual solution is primarily an integration and wiring exercise on top of this foundation.
